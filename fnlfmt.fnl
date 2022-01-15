@@ -89,7 +89,7 @@ We want everything to be on one line as much as possible, (except for let)."
 
 (local force-initial-newline {:do true :eval-compiler true})
 
-(fn view-init-body [t view inspector start-indent out callee]
+(fn view-init-body [options t view inspector start-indent out callee]
   "Certain forms need special handling of their first few args. Returns the
 number of handled arguments."
   (if (. force-initial-newline callee)
@@ -106,7 +106,7 @@ number of handled arguments."
         indent2 (+ indent (length (second:match "[^\n]*$")))]
     (when (not= nil (. t 2))
       (table.insert out second))
-    (if (. fn-forms callee)
+    (if (or (. fn-forms callee) (. options.fn-forms callee))
         (view-fn-args t view inspector indent2 start-indent out callee)
         3)))
 
@@ -130,9 +130,10 @@ number of handled arguments."
   (and (not (= start-index i))
        (or (prev:match "^ *%(fn [^%[]") (viewed:match "^ *%(fn [^%[]"))))
 
-(fn view-body [t view inspector start-indent out callee]
+(fn view-body [options t view inspector start-indent out callee]
   "Insert arguments to a call to a special that takes body arguments."
-  (let [start-index (view-init-body t view inspector start-indent out callee)
+  (let [start-index (view-init-body options t view inspector start-indent out
+                                    callee)
         ;; do and if don't actually have special indentation but they do need
         ;; a newline after every form, so we can't use normal call formatting
         indent (if (. one-element-per-line-forms callee)
@@ -199,11 +200,11 @@ number of handled arguments."
   (and (= :table (type first)) (= :table (type second))
        (not= line (or first.line line) (or second.line line))))
 
-(fn view-maybe-body [t view inspector indent start-indent out callee]
+(fn view-maybe-body [options t view inspector indent start-indent out callee]
   (if (pairwise-if? t indent 2 view)
       (view-pairwise-if t view inspector indent out)
       (originally-different-lines? t t.line)
-      (view-body t view inspector (+ start-indent 2) out callee)
+      (view-body options t view inspector (+ start-indent 2) out callee)
       (view-call t view inspector indent out callee)))
 
 (fn newline-if-ends-in-comment [out indent]
@@ -212,29 +213,33 @@ number of handled arguments."
 
 (local sugars {:hashfn "#" :quote "`" :unquote ","})
 
-(fn sweeten [t view inspector indent view-list]
+(fn sweeten [t view inspector indent]
   (.. (. sugars (tostring (. t 1))) (view (. t 2) inspector (+ indent 1))))
 
 (local maybe-body {:-> true :->> true :-?> true :-?>> true :doto true :if true})
 
 (local renames {"#" :length "~=" :not=})
 
-(fn view-list [t view inspector start-indent]
+(fn view-list [options t view inspector start-indent]
   (if (. sugars (tostring (. t 1)))
-      (sweeten t view inspector start-indent view-list)
+      (sweeten t view inspector start-indent)
       (let [callee (view (. t 1) inspector (+ start-indent 1))
             callee (or (. renames callee) callee)
             out ["(" callee]
-            indent (if (?. syntax callee :body-form?)
+            is-body-form (or (?. syntax callee :body-form?)
+                             (. options.body-forms callee)
+                             (. options.fn-forms callee))
+            indent (if is-body-form
                        (+ start-indent 2)
                        (+ start-indent (length callee) 2))]
         ;; indent differently if it's calling a special form with body args
-        (if (?. syntax callee :body-form?)
-            (view-body t view inspector indent out callee)
+        (if is-body-form
+            (view-body options t view inspector indent out callee)
             ;; in some cases we treat it differently depending on whether the
             ;; original code was multi-line or not
             (. maybe-body callee)
-            (view-maybe-body t view inspector indent start-indent out callee)
+            (view-maybe-body options t view inspector indent start-indent out
+                             callee)
             (view-call t view inspector indent out))
         (newline-if-ends-in-comment out indent)
         (table.insert out ")")
@@ -245,7 +250,8 @@ number of handled arguments."
 (fn maybe-attach-comment [x indent cs]
   (if (and cs (< 0 (length cs)))
       (.. (table.concat (icollect [_ c (ipairs cs)]
-                          (tostring c)) (.. "\n" (string.rep " " indent)))
+                          (tostring c))
+                        (.. "\n" (string.rep " " indent)))
           (.. "\n" (string.rep " " indent)) x)
       x))
 
@@ -266,8 +272,7 @@ number of handled arguments."
         (each [_ c (ipairs last-comments)]
           (table.insert pair-strs (tostring c)))
         (table.insert pair-strs "}")
-        (.. "{" (table.concat pair-strs
-                              (.. "\n" (string.rep " " indent)))))
+        (.. "{" (table.concat pair-strs (.. "\n" (string.rep " " indent)))))
       (.. "{" (table.concat pair-strs (.. "\n" (string.rep " " indent))) "}")))
 
 (fn view-kv [t view inspector indent]
@@ -312,11 +317,11 @@ When f returns a truthy value, recursively walks the children."
   (and (s:find "^[-%w?^_!$%&*+./|<=>]+$")
        (not (s:find "^[-?^_!$%&*+./@|<=>%\\]+$"))))
 
-(fn fnlfmt [ast]
+(fn fnlfmt [ast options]
   "Return a formatted representation of ast."
   (let [{&as list-mt : __fennelview} (getmetatable (fennel.list))
         ;; list's metamethod for fennelview is where the magic happens!
-        _ (set list-mt.__fennelview view-list)
+        _ (set list-mt.__fennelview (partial view-list options))
         ;; this would be better if we operated on a copy!
         _ (walk-tree ast set-fennelview-metamethod)
         (ok? val) (pcall fennel.view ast
@@ -332,14 +337,15 @@ When f returns a truthy value, recursively walks the children."
   "Use previous line numbering to determine whether to space out forms."
   (not (and prev-ast.line ast.line (= 1 (- ast.line prev-ast.line)))))
 
-(fn format-file [filename {: no-comments}]
+(fn format-file [filename options]
   "Read source from a file and return formatted source."
   (let [f (match filename
             "-" io.stdin
             _ (assert (io.open filename :r) "File not found."))
         contents (f:read :*all)
         parser (-> (fennel.stringStream contents)
-                   (fennel.parser filename {:comments (not no-comments)}))
+                   (fennel.parser filename
+                                  {:comments (not options.no-comments)}))
         out []]
     (f:close)
     (var (skip-next? prev-ast) false)
@@ -357,7 +363,7 @@ When f returns a truthy value, recursively walks the children."
           (do
             (when (and prev-ast (space-out-forms? prev-ast ast))
               (table.insert out ""))
-            (table.insert out (fnlfmt ast))
+            (table.insert out (fnlfmt ast options))
             (set skip-next? false)))
       (set prev-ast ast))
     (table.insert out "")
